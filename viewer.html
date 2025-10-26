@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Screen Mirror — Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Arial;margin:1rem}
+    #video{width:100%;max-width:900px;border:1px solid #ccc;border-radius:6px}
+    #qr{margin-top:1rem}
+    #log{color:#555;margin-top:.5rem}
+    input,button{padding:.5rem;margin:.25rem 0}
+  </style>
+</head>
+<body>
+  <h2>Screen Mirror — Viewer</h2>
+  <div>
+    <button id="createBtn">Create Session</button>
+    <label> PIN: <input id="pin" placeholder="4-digit PIN" maxlength="4" /></label>
+  </div>
+  <div id="qr"></div>
+  <div id="log">Status: idle</div>
+  <video id="video" autoplay playsinline controls></video>
+
+  <!-- firebase -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+  <script>
+ // Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyC0sMcGGwgSzmpUinsKWXztrOEkpraPWDI",
+  authDomain: "qr-mirror-demo.firebaseapp.com",
+  databaseURL: "https://qr-mirror-demo-default-rtdb.asia-southeast1.firebasedatabase.app/",
+  projectId: "qr-mirror-demo",
+  storageBucket: "qr-mirror-demo.firebasestorage.app",
+  messagingSenderId: "43829618317",
+  appId: "1:43829618317:web:767414788de54eb7d3a4c4",
+  measurementId: "G-LYGDZKKX2M"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+  var firebaseConfig = {
+    apiKey: "PASTE_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    databaseURL: "https://qr-mirror-demo-default-rtdb.asia-southeast1.firebasedatabase.app/",
+    projectId: "YOUR_PROJECT",
+    storageBucket: "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "SENDER_ID",
+    appId: "APP_ID"
+  };
+  // =============================================
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+
+  const createBtn = document.getElementById('createBtn');
+  const qrDiv = document.getElementById('qr');
+  const log = document.getElementById('log');
+  const pinInput = document.getElementById('pin');
+  const videoEl = document.getElementById('video');
+
+  // STUN servers (public) for basic NAT traversal
+  const pcConfig = { iceServers: [{urls: 'stun:stun.l.google.com:19302'}] };
+
+  createBtn.addEventListener('click', async () => {
+    createBtn.disabled = true;
+    const pin = (pinInput.value || Math.floor(1000 + Math.random()*9000).toString());
+    pinInput.value = pin;
+    log.textContent = 'Creating session...';
+
+    // create a short random session id
+    const sessionId = Math.random().toString(36).substr(2, 8);
+    const sessionRef = db.ref('sessions/' + sessionId);
+    await sessionRef.set({ createdAt: Date.now(), pin });
+    // remove old data when done
+    sessionRef.onDisconnect().remove();
+
+    // create RTCPeerConnection
+    const pc = new RTCPeerConnection(pcConfig);
+
+    // when remote track arrives, attach to video element
+    pc.ontrack = (e) => {
+      log.textContent = 'Remote stream received';
+      videoEl.srcObject = e.streams[0];
+    };
+
+    // ICE -> push to Firebase
+    const localCandidatesRef = sessionRef.child('viewerCandidates');
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        localCandidatesRef.push(event.candidate.toJSON());
+      }
+    };
+
+    // We are the *caller* (we create offer), but we won't send any media (viewer receives only)
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sessionRef.child('offer').set(offer.toJSON());
+
+    // Show QR (link to sharer with sessionId and PIN)
+    const sharerUrl = location.origin + location.pathname.replace(/viewer\.html$/,'sharer.html') +
+                      '?session=' + sessionId + '&pin=' + encodeURIComponent(pin);
+    qrDiv.innerHTML = `<p>Share this QR with the person who will share their screen:</p>
+      <img id="qrimg" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(sharerUrl)}" alt="QR">
+      <p><a href="${sharerUrl}" target="_blank">${sharerUrl}</a></p>`;
+
+    log.textContent = 'Waiting for sharer to connect. Session: ' + sessionId;
+
+    // Listen for answer from sharer
+    sessionRef.child('answer').on('value', async snap => {
+      const answer = snap.val();
+      if (!answer) return;
+      log.textContent = 'Answer received — setting remote description...';
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    });
+
+    // Listen for remote ICE candidates from sharer and add them
+    sessionRef.child('sharerCandidates').on('child_added', snap => {
+      const cand = snap.val();
+      if (!cand) return;
+      pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn(e));
+    });
+
+    // Optional: cleanup when the page unloads
+    window.addEventListener('beforeunload', () => {
+      pc.close();
+      sessionRef.remove();
+    });
+  });
+  </script>
+</body>
+</html>

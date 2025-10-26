@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Screen Mirror — Sharer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Arial;margin:1rem}
+    button{padding:.6rem;margin:.5rem 0}
+    #status{color:#444}
+  </style>
+</head>
+<body>
+  <h2>Screen Mirror — Share Your Screen</h2>
+  <div id="status">Initializing...</div>
+  <div>
+    <button id="shareBtn">Share Screen</button>
+    <button id="cameraBtn">Share Camera (fallback)</button>
+  </div>
+
+  <!-- firebase -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+  <script>
+ // Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyC0sMcGGwgSzmpUinsKWXztrOEkpraPWDI",
+  authDomain: "qr-mirror-demo.firebaseapp.com",
+  databaseURL: "https://qr-mirror-demo-default-rtdb.asia-southeast1.firebasedatabase.app/",
+  projectId: "qr-mirror-demo",
+  storageBucket: "qr-mirror-demo.firebasestorage.app",
+  messagingSenderId: "43829618317",
+  appId: "1:43829618317:web:767414788de54eb7d3a4c4",
+  measurementId: "G-LYGDZKKX2M"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+  var firebaseConfig = {
+    apiKey: "PASTE_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    databaseURL: "https://qr-mirror-demo-default-rtdb.asia-southeast1.firebasedatabase.app/",
+    projectId: "YOUR_PROJECT",
+    storageBucket: "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "SENDER_ID",
+    appId: "APP_ID"
+  };
+  // ==================================
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+
+  const status = document.getElementById('status');
+  const shareBtn = document.getElementById('shareBtn');
+  const cameraBtn = document.getElementById('cameraBtn');
+
+  // parse session id & pin from URL
+  const urlParams = new URLSearchParams(location.search);
+  const sessionId = urlParams.get('session');
+  const pinFromUrl = urlParams.get('pin') || '';
+  if (!sessionId) {
+    status.textContent = 'No session ID provided in URL.';
+    shareBtn.disabled = cameraBtn.disabled = true;
+  } else {
+    status.textContent = 'Session: ' + sessionId;
+  }
+
+  const pcConfig = { iceServers: [{urls: 'stun:stun.l.google.com:19302'}] };
+
+  async function startShare(mode = 'screen') {
+    try {
+      // check session and pin
+      const sessionRef = db.ref('sessions/' + sessionId);
+      const snap = await sessionRef.once('value');
+      if (!snap.exists()) {
+        status.textContent = 'Session not found or expired.';
+        return;
+      }
+      const sessionData = snap.val();
+      // verify PIN match (optional)
+      if (sessionData.pin && pinFromUrl && sessionData.pin !== pinFromUrl) {
+        status.textContent = 'PIN mismatch. Aborting.';
+        return;
+      }
+
+      status.textContent = 'Preparing connection...';
+
+      // get media: try screen, else camera
+      let stream;
+      if (mode === 'screen') {
+        try {
+          stream = await navigator.mediaDevices.getDisplayMedia({video:true, audio:false});
+        } catch (e) {
+          console.warn('Screen capture failed', e);
+          status.textContent = 'Screen capture failed or not supported on this browser. Use Camera fallback.';
+          return;
+        }
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      }
+
+      // show a preview small popup for sharer (optional)
+      const preview = document.createElement('video');
+      preview.autoplay = true;
+      preview.playsInline = true;
+      preview.muted = true;
+      preview.style.width = '140px';
+      preview.style.position = 'fixed';
+      preview.style.right = '10px';
+      preview.style.bottom = '10px';
+      preview.style.border = '1px solid #ccc';
+      document.body.appendChild(preview);
+      preview.srcObject = stream;
+
+      // create peer connection
+      const pc = new RTCPeerConnection(pcConfig);
+
+      // add stream tracks to peer
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+      // collect local ICE candidates and push to Firebase
+      const localCandidatesRef = sessionRef.child('sharerCandidates');
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          localCandidatesRef.push(ev.candidate.toJSON());
+        }
+      };
+
+      // read offer from session
+      const offerSnap = await sessionRef.child('offer').once('value');
+      const offer = offerSnap.val();
+      if (!offer) {
+        status.textContent = 'Offer not found - viewer did not create session or it expired.';
+        return;
+      }
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+      // create answer and write to Firebase
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await sessionRef.child('answer').set(answer.toJSON());
+
+      // listen for viewer ICE candidates
+      sessionRef.child('viewerCandidates').on('child_added', snap => {
+        const cand = snap.val();
+        if (!cand) return;
+        pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn(e));
+      });
+
+      status.textContent = 'Sharing started — your screen is being shared. You can stop anytime.';
+      // cleanup: remove session when leaving
+      window.addEventListener('beforeunload', () => {
+        try { stream.getTracks().forEach(t => t.stop()); } catch(e){}
+        sessionRef.remove();
+      });
+
+    } catch (err) {
+      console.error(err);
+      status.textContent = 'Error: ' + (err.message || err);
+    }
+  }
+
+  shareBtn.addEventListener('click', () => startShare('screen'));
+  cameraBtn.addEventListener('click', () => startShare('camera'));
+  </script>
+</body>
+</html>
